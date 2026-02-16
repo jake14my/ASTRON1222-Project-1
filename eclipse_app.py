@@ -17,6 +17,14 @@ from dotenv import load_dotenv
 import litellm
 from litellm import completion
 import streamlit as st
+from eclipse_utils import (
+    parse_coord,
+    haversine_km,
+    overlap_fraction,
+    get_eclipse_params,
+    Eclipse,
+    viewer_offset as eclipse_viewer_offset,
+)
 
 # ============================================================
 # PAGE CONFIG
@@ -32,149 +40,34 @@ API_BASE = "https://litellmproxy.osu-ai.org"
 
 @st.cache_data
 def load_eclipse_data():
-    with open("eclipse_data.json") as f:
-        return json.load(f)
+    try:
+        with open("eclipse_data.json") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        st.error("Error: eclipse_data.json not found. Please run EclipseData.ipynb first to generate the data file.")
+        st.stop()
+    except json.JSONDecodeError as e:
+        st.error(f"Error: eclipse_data.json is corrupted or invalid. {e}")
+        st.stop()
 
 data = load_eclipse_data()
 eclipse_list = data["eclipse_list"]
 
+# Validate eclipse_list is not empty
+if not eclipse_list:
+    st.error("Error: No eclipse data found in eclipse_data.json")
+    st.stop()
+
 # ============================================================
-# GEOMETRY HELPERS
+# GEOMETRY HELPERS (using shared utilities from eclipse_utils)
+# Additional functions specific to Streamlit app below
 # ============================================================
-
-def parse_coord(coord_str):
-    if not coord_str or coord_str.strip() == "-":
-        return 0.0
-    match = re.match(r"(\d+)([NSEW])", coord_str.strip())
-    if match:
-        val = float(match.group(1))
-        if match.group(2) in ("S", "W"):
-            val = -val
-        return val
-    return 0.0
-
-
-def haversine_km(lat1, lon1, lat2, lon2):
-    R = 6371.0
-    la1, lo1, la2, lo2 = map(np.radians, [lat1, lon1, lat2, lon2])
-    dlat, dlon = la2 - la1, lo2 - lo1
-    a = np.sin(dlat / 2) ** 2 + np.cos(la1) * np.cos(la2) * np.sin(dlon / 2) ** 2
-    return R * 2 * np.arcsin(np.sqrt(np.clip(a, 0, 1)))
-
-
-def overlap_fraction(sun_r, moon_r, d):
-    if d >= sun_r + moon_r:
-        return 0.0
-    if d <= abs(sun_r - moon_r):
-        return 1.0 if moon_r >= sun_r else (moon_r / sun_r) ** 2
-    cos1 = np.clip((d**2 + sun_r**2 - moon_r**2) / (2 * d * sun_r), -1, 1)
-    cos2 = np.clip((d**2 + moon_r**2 - sun_r**2) / (2 * d * moon_r), -1, 1)
-    a1 = sun_r**2 * np.arccos(cos1)
-    a2 = moon_r**2 * np.arccos(cos2)
-    det = (-d + sun_r + moon_r) * (d + sun_r - moon_r) * \
-          (d - sun_r + moon_r) * (d + sun_r + moon_r)
-    a3 = 0.5 * np.sqrt(max(det, 0))
-    return (a1 + a2 - a3) / (np.pi * sun_r**2)
-
-
-def get_eclipse_params(eclipse):
-    raw = eclipse.get("_raw", {})
-    ecl_lat = parse_coord(raw.get("latitude", "0N"))
-    ecl_lon = parse_coord(raw.get("longitude", "0E"))
-    magnitude = eclipse.get("magnitude") or 0.95
-    pw = raw.get("path_width_km", "-")
-    try:
-        path_w = float(pw)
-    except (ValueError, TypeError):
-        path_w = 0.0
-    gamma_str = raw.get("gamma", "0")
-    try:
-        gamma = float(gamma_str)
-    except (ValueError, TypeError):
-        gamma = 0.0
-    return ecl_lat, ecl_lon, magnitude, path_w, gamma
-
-
-MONTH_NUM = {
-    "Jan": 1, "Feb": 2, "Mar": 3, "Apr": 4,
-    "May": 5, "Jun": 6, "Jul": 7, "Aug": 8,
-    "Sep": 9, "Oct": 10, "Nov": 11, "Dec": 12,
-}
-
-
-def estimate_path_bearing(eclipse):
-    """Estimate eclipse path bearing from the date.
-    Spring (Sun moving N) → NE path (~40°). Fall (Sun moving S) → SE path (~140°)."""
-    date_str = eclipse.get("date_raw", "")
-    parts = date_str.split()
-    month = MONTH_NUM.get(parts[1], 6) if len(parts) > 1 else 6
-    day = int(parts[2]) if len(parts) > 2 else 15
-    doy = (month - 1) * 30.4 + day
-    dec_rate = np.cos(2 * np.pi * (doy - 80) / 365.25)
-    return 90.0 - dec_rate * 50.0
-
-
-def min_perp_distance_to_path(obs_lat, obs_lon, ecl_lat, ecl_lon,
-                               gamma=0.0, path_bearing=90.0,
-                               max_along_track_km=7500):
-    """Perpendicular distance from observer to estimated eclipse centerline.
-    Uses gamma latitude gate + bearing-constrained cross-track distance."""
-    R = 6371.0
-    d13_km = haversine_km(obs_lat, obs_lon, ecl_lat, ecl_lon)
-    if d13_km < 200:
-        return d13_km
-    gamma_abs = min(abs(gamma), 0.999)
-    lat_half_range = np.degrees(np.arccos(gamma_abs)) * 0.55 + 5.0
-    if abs(obs_lat - ecl_lat) > lat_half_range:
-        return d13_km
-    d13 = d13_km / R
-    lat1, lon1 = np.radians(ecl_lat), np.radians(ecl_lon)
-    lat2, lon2 = np.radians(obs_lat), np.radians(obs_lon)
-    dlon = lon2 - lon1
-    x = np.sin(dlon) * np.cos(lat2)
-    y = np.cos(lat1) * np.sin(lat2) - np.sin(lat1) * np.cos(lat2) * np.cos(dlon)
-    brg13 = np.arctan2(x, y)
-    min_xt = d13_km
-    for b_offset in range(-2, 3):
-        brg12 = np.radians(path_bearing + b_offset)
-        xt = abs(R * np.arcsin(np.clip(np.sin(d13) * np.sin(brg13 - brg12), -1, 1)))
-        if xt < min_xt:
-            cos_xt = np.cos(xt / R)
-            if cos_xt > 1e-10:
-                cos_at = np.clip(np.cos(d13) / cos_xt, -1, 1)
-                at = R * np.arccos(cos_at)
-                if at <= max_along_track_km:
-                    min_xt = xt
-    return min_xt
 
 
 def viewer_offset(obs_lat, obs_lon, eclipse):
     """Parallax-calibrated Moon offset from the Sun center (Sun-radii units).
-    Uses the known path width to convert perpendicular distance to angular
-    offset: at perp = eff_half → offset = (mag-1), the totality threshold."""
-    ecl_lat, ecl_lon, mag, path_w, gamma = get_eclipse_params(eclipse)
-    sun_r = 1.0
-    moon_r = mag * sun_r
-    max_off = sun_r + moon_r
-    dist_km = haversine_km(obs_lat, obs_lon, ecl_lat, ecl_lon)
-    if path_w > 0:
-        half = path_w / 2.0
-        width_factor = max(0.5, 1.0 - dist_km / 3000.0 * 0.6)
-        eff_half = half * width_factor
-        bearing = estimate_path_bearing(eclipse)
-        perp_km = min_perp_distance_to_path(
-            obs_lat, obs_lon, ecl_lat, ecl_lon,
-            gamma=gamma, path_bearing=bearing
-        )
-        # Parallax-calibrated: offset / (mag-1) = perp_km / eff_half
-        if eff_half > 0:
-            offset = perp_km * (mag - 1) * sun_r / eff_half
-        else:
-            offset = dist_km / 3500.0 * max_off
-        return min(offset, max_off + 0.3)
-    else:
-        base = abs(gamma) * 0.6
-        return min(base + dist_km / 3500.0 * 0.6, max_off + 0.3)
+    Uses the Eclipse class from eclipse_utils for consistent calculations."""
+    return eclipse_viewer_offset(obs_lat, obs_lon, eclipse)
 
 
 def eclipse_visibility_km(eclipse):
@@ -397,9 +290,16 @@ def build_eclipse_context(user_message):
     for pat in coord_patterns:
         m = re.search(pat, user_message)
         if m:
-            obs_lat = float(m.group(1))
-            obs_lon = float(m.group(2))
-            break
+            try:
+                obs_lat = float(m.group(1))
+                obs_lon = float(m.group(2))
+                # Validate coordinate ranges
+                if -90 <= obs_lat <= 90 and -180 <= obs_lon <= 180:
+                    break
+                else:
+                    obs_lat, obs_lon = None, None
+            except (ValueError, IndexError):
+                obs_lat, obs_lon = None, None
 
     for city, (clat, clon) in CITY_COORDS.items():
         if city in msg:
@@ -495,6 +395,9 @@ def chat_with_llm(user_message, chat_history):
     chat_history.append({"role": "user", "content": augmented_msg})
     messages = [{"role": "system", "content": SYSTEM_PROMPT}] + chat_history
 
+    if not api_key:
+        return "Error: API key not configured. Please set ASTRO1221_API_KEY in your .env file.", obs_lat, obs_lon
+
     try:
         response = completion(
             model="openai/GPT-4.1-mini",
@@ -578,14 +481,20 @@ with col_chat:
 
         # Parse VIEWER_SET from reply to update visualization
         v_lat, v_lon, v_eclipse = parse_viewer_set(reply)
-        if v_lat is not None:
-            st.session_state.viewer_lat = v_lat
-            st.session_state.viewer_lon = v_lon
-            idx = find_eclipse_index_by_date(v_eclipse)
-            if idx is not None:
-                st.session_state.viewer_eclipse_idx = idx
-                st.session_state.viewer_time = 0.0
-            st.toast(f"Viewer updated: {v_lat:.1f}°N, {v_lon:.1f}°E", icon="📍")
+        if v_lat is not None and v_lon is not None:
+            # Validate coordinates before setting
+            if -90 <= v_lat <= 90 and -180 <= v_lon <= 180:
+                st.session_state.viewer_lat = v_lat
+                st.session_state.viewer_lon = v_lon
+                idx = find_eclipse_index_by_date(v_eclipse)
+                if idx is not None and 0 <= idx < len(eclipse_list):
+                    st.session_state.viewer_eclipse_idx = idx
+                    st.session_state.viewer_time = 0.0
+                    st.toast(f"Viewer updated: {v_lat:.1f}°N, {v_lon:.1f}°E", icon="📍")
+                else:
+                    st.toast(f"Coordinates set, but eclipse '{v_eclipse}' not found", icon="⚠️")
+            else:
+                st.toast("Invalid coordinates from chatbot", icon="⚠️")
 
         st.session_state.messages.append({"role": "assistant", "content": reply})
         st.rerun()
@@ -599,6 +508,11 @@ with col_viz:
         f"{e['date_raw']}  —  {e['type']}  (Mag: {e['magnitude']})"
         for e in eclipse_list
     ]
+    # Ensure index is valid
+    valid_idx = max(0, min(st.session_state.viewer_eclipse_idx, len(eclipse_list) - 1))
+    if valid_idx != st.session_state.viewer_eclipse_idx:
+        st.session_state.viewer_eclipse_idx = valid_idx
+    
     selected_idx = st.selectbox(
         "Eclipse:",
         range(len(eclipse_list)),
@@ -606,6 +520,10 @@ with col_viz:
         format_func=lambda i: eclipse_labels[i],
         key="eclipse_select",
     )
+    
+    # Validate selected_idx is within bounds
+    if not (0 <= selected_idx < len(eclipse_list)):
+        selected_idx = 0
 
     # Sliders
     time_frac = st.slider(

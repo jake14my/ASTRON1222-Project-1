@@ -1,0 +1,8 @@
+numpy
+matplotlib
+streamlit
+litellm
+python-dotenv
+ipywidgets
+beautifulsoup4
+requests
