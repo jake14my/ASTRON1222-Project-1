@@ -95,16 +95,34 @@ def get_eclipse_params(eclipse):
     return ecl_lat, ecl_lon, magnitude, path_w, gamma
 
 
-def min_perp_distance_to_path(obs_lat, obs_lon, ecl_lat, ecl_lon, gamma=0.0, max_along_track_km=7500):
-    """
-    Estimate minimum perpendicular distance from observer to the eclipse
-    centerline. Uses cross-track distance with a gamma-based latitude gate.
-    """
+MONTH_NUM = {
+    "Jan": 1, "Feb": 2, "Mar": 3, "Apr": 4,
+    "May": 5, "Jun": 6, "Jul": 7, "Aug": 8,
+    "Sep": 9, "Oct": 10, "Nov": 11, "Dec": 12,
+}
+
+
+def estimate_path_bearing(eclipse):
+    """Estimate eclipse path bearing from the date.
+    Spring (Sun moving N) → NE path (~40°). Fall (Sun moving S) → SE path (~140°)."""
+    date_str = eclipse.get("date_raw", "")
+    parts = date_str.split()
+    month = MONTH_NUM.get(parts[1], 6) if len(parts) > 1 else 6
+    day = int(parts[2]) if len(parts) > 2 else 15
+    doy = (month - 1) * 30.4 + day
+    dec_rate = np.cos(2 * np.pi * (doy - 80) / 365.25)
+    return 90.0 - dec_rate * 50.0
+
+
+def min_perp_distance_to_path(obs_lat, obs_lon, ecl_lat, ecl_lon,
+                               gamma=0.0, path_bearing=90.0,
+                               max_along_track_km=7500):
+    """Perpendicular distance from observer to estimated eclipse centerline.
+    Uses gamma latitude gate + bearing-constrained cross-track distance."""
     R = 6371.0
     d13_km = haversine_km(obs_lat, obs_lon, ecl_lat, ecl_lon)
     if d13_km < 200:
         return d13_km
-    # Latitude-range gate: high |gamma| = narrow latitude band
     gamma_abs = min(abs(gamma), 0.999)
     lat_half_range = np.degrees(np.arccos(gamma_abs)) * 0.55 + 5.0
     if abs(obs_lat - ecl_lat) > lat_half_range:
@@ -117,8 +135,8 @@ def min_perp_distance_to_path(obs_lat, obs_lon, ecl_lat, ecl_lon, gamma=0.0, max
     y = np.cos(lat1) * np.sin(lat2) - np.sin(lat1) * np.cos(lat2) * np.cos(dlon)
     brg13 = np.arctan2(x, y)
     min_xt = d13_km
-    for b_deg in range(0, 180, 2):
-        brg12 = np.radians(b_deg)
+    for b_offset in range(-2, 3):
+        brg12 = np.radians(path_bearing + b_offset)
         xt = abs(R * np.arcsin(np.clip(np.sin(d13) * np.sin(brg13 - brg12), -1, 1)))
         if xt < min_xt:
             cos_xt = np.cos(xt / R)
@@ -131,24 +149,32 @@ def min_perp_distance_to_path(obs_lat, obs_lon, ecl_lat, ecl_lon, gamma=0.0, max
 
 
 def viewer_offset(obs_lat, obs_lon, eclipse):
+    """Parallax-calibrated Moon offset from the Sun center (Sun-radii units).
+    Uses the known path width to convert perpendicular distance to angular
+    offset: at perp = eff_half → offset = (mag-1), the totality threshold."""
     ecl_lat, ecl_lon, mag, path_w, gamma = get_eclipse_params(eclipse)
     sun_r = 1.0
     moon_r = mag * sun_r
     max_off = sun_r + moon_r
     dist_km = haversine_km(obs_lat, obs_lon, ecl_lat, ecl_lon)
-    vis_km = 3500.0
     if path_w > 0:
         half = path_w / 2.0
+        width_factor = max(0.5, 1.0 - dist_km / 3000.0 * 0.6)
+        eff_half = half * width_factor
+        bearing = estimate_path_bearing(eclipse)
         perp_km = min_perp_distance_to_path(
-            obs_lat, obs_lon, ecl_lat, ecl_lon, gamma=gamma
+            obs_lat, obs_lon, ecl_lat, ecl_lon,
+            gamma=gamma, path_bearing=bearing
         )
-        if perp_km <= half:
-            return 0.0
-        excess = perp_km - half
-        return min(excess / vis_km * max_off, max_off + 0.3)
+        # Parallax-calibrated: offset / (mag-1) = perp_km / eff_half
+        if eff_half > 0:
+            offset = perp_km * (mag - 1) * sun_r / eff_half
+        else:
+            offset = dist_km / 3500.0 * max_off
+        return min(offset, max_off + 0.3)
     else:
         base = abs(gamma) * 0.6
-        return min(base + dist_km / vis_km * 0.6, max_off + 0.3)
+        return min(base + dist_km / 3500.0 * 0.6, max_off + 0.3)
 
 
 def eclipse_visibility_km(eclipse):
