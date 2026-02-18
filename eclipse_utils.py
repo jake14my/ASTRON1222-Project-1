@@ -1,6 +1,19 @@
 """
 Shared utilities for eclipse calculations and data handling.
-Contains the Eclipse class and helper functions used across notebooks and the Streamlit app.
+
+This module provides the core astronomy and geometry functions used
+across the project. It includes:
+
+  - Coordinate parsing (NASA format → signed degrees)
+  - Haversine formula (great-circle distance on a sphere)
+  - Circle-overlap obscuration (how much of the Sun the Moon covers)
+  - The Eclipse class (parallax-calibrated geometric heuristic model
+    for estimating what an observer sees during an eclipse)
+  - Helper wrappers for the Streamlit app
+
+The Eclipse class uses a simplified geometric model — not full
+Besselian element computation — so results are estimates, especially
+near path boundaries.
 """
 
 import re
@@ -15,6 +28,16 @@ MONTH_NUM = {
 }
 
 
+# =================================================================
+# Coordinate parsing
+# =================================================================
+# NASA's eclipse catalog encodes latitude/longitude as a number
+# followed by a cardinal direction letter: "11S" = 11° South,
+# "131W" = 131° West. This function converts that to signed
+# decimal degrees (negative for South and West) so the rest of
+# the codebase can do normal arithmetic with coordinates.
+# =================================================================
+
 def parse_coord(coord_str: str) -> float:
     """Parse NASA coordinate string like '11S' or '131W' to signed degrees."""
     if not coord_str or coord_str.strip() == "-":
@@ -28,6 +51,21 @@ def parse_coord(coord_str: str) -> float:
     return 0.0
 
 
+# =================================================================
+# Haversine formula
+# =================================================================
+# Computes the great-circle (shortest surface) distance between
+# two points on a sphere. The formula uses the law of haversines:
+#
+#   a = sin²(Δlat/2) + cos(lat1)·cos(lat2)·sin²(Δlon/2)
+#   d = 2R · arcsin(√a)
+#
+# where R = 6371 km (mean Earth radius). This is the standard
+# method for computing distances on a globe when you only have
+# latitude and longitude. It assumes a perfect sphere, which
+# introduces < 0.3% error compared to the WGS-84 ellipsoid.
+# =================================================================
+
 def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     """Great-circle distance in km between two points on Earth."""
     R = 6371.0
@@ -37,6 +75,29 @@ def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     a = np.sin(dlat / 2) ** 2 + np.cos(la1) * np.cos(la2) * np.sin(dlon / 2) ** 2
     return R * 2 * np.arcsin(np.sqrt(np.clip(a, 0, 1)))
 
+
+# =================================================================
+# Circle-overlap obscuration
+# =================================================================
+# During a solar eclipse, the Sun and Moon appear as two circular
+# disks in the sky. This function computes the fraction of the
+# Sun's area that is covered (obscured) by the Moon, given:
+#
+#   sun_r  — apparent radius of the Sun  (arbitrary units)
+#   moon_r — apparent radius of the Moon (same units)
+#   d      — center-to-center distance between the two disks
+#
+# Three geometric cases:
+#   1. d >= sun_r + moon_r  → no overlap (0%)
+#   2. d <= |sun_r - moon_r| → full containment (100% if Moon
+#      is larger; else (moon_r/sun_r)² for annular geometry)
+#   3. Otherwise → partial overlap computed as the area of the
+#      lens-shaped intersection of two circles, using the
+#      standard two-circle intersection formula.
+#
+# This is a purely geometric calculation — it does not account
+# for limb darkening or atmospheric refraction.
+# =================================================================
 
 def overlap_fraction(sun_r: float, moon_r: float, d: float) -> float:
     """
@@ -69,6 +130,51 @@ def overlap_fraction(sun_r: float, moon_r: float, d: float) -> float:
     a3 = 0.5 * np.sqrt(max(det, 0))
     return (a1 + a2 - a3) / (np.pi * sun_r**2)
 
+
+# =================================================================
+# Eclipse class
+# =================================================================
+# Models a single solar eclipse and estimates what an observer at
+# any location on Earth would see, using a parallax-calibrated
+# geometric heuristic.
+#
+# Key astronomy concepts used:
+#
+# • Magnitude — ratio of the Moon's apparent diameter to the
+#   Sun's. Mag > 1 means the Moon fully covers the Sun (total);
+#   mag < 1 means a ring of Sun remains visible (annular).
+#
+# • Gamma — how close the Moon's shadow axis passes to Earth's
+#   center, measured in Earth radii. |γ| < 1 means the shadow
+#   touches the surface; higher values give partial-only eclipses.
+#
+# • Saros cycle — eclipses repeat every ~18 years 11 days in
+#   the same Saros series, with similar geometry each time.
+#
+# • Path width — the width of the Moon's umbral (or antumbral)
+#   shadow on Earth's surface. Only observers inside this narrow
+#   corridor see totality (or annularity).
+#
+# • Topocentric parallax — the Moon is close enough (~384 400 km)
+#   that an observer's position on Earth's surface shifts where
+#   the Moon appears against the Sun. This is why the path of
+#   totality is narrow: a few hundred km sideways changes the
+#   Moon's apparent position enough to break total coverage.
+#
+# The class uses the catalog's path width to *calibrate* this
+# parallax effect: at the edge of the totality path, the Moon's
+# offset equals exactly (magnitude − 1) Sun-radii — the
+# threshold where totality ends. Farther away, the offset grows
+# proportionally, giving a smooth partial-eclipse falloff.
+#
+# Limitations:
+#   - Uses one reference point (greatest eclipse), not the full
+#     centerline, so accuracy degrades far from that point.
+#   - Path bearing is estimated from the season, not computed
+#     from orbital elements.
+#   - Shadow width tapering is a linear heuristic.
+#   - Not suitable for precise contact-time predictions.
+# =================================================================
 
 class Eclipse:
     """
@@ -143,6 +249,17 @@ class Eclipse:
             lines.append(f"Path width: {self.path_width_km:.0f} km")
         return "\n".join(lines)
 
+    # --- Path bearing estimation ---
+    # The Moon's shadow always sweeps west-to-east because the
+    # Moon orbits eastward. But the path tilts north or south
+    # depending on the season: in spring the Sun moves north in
+    # declination, pulling the shadow path northeast; in fall it
+    # moves south, giving a southeast path. Near a solstice the
+    # declination is nearly stationary, so the path runs roughly
+    # due east. This method approximates the tilt angle from the
+    # day-of-year using a cosine model of the Sun's declination
+    # rate of change.
+
     def estimate_path_bearing(self) -> float:
         """
         Estimate the eclipse-path bearing from the date.
@@ -162,6 +279,15 @@ class Eclipse:
         dec_rate = np.cos(2 * np.pi * (doy - 80) / 365.25)
         return 90.0 - dec_rate * 50.0
 
+    # --- Shadow width tapering ---
+    # The umbral shadow is widest at the point of greatest
+    # eclipse and narrows as it moves along the path. This is
+    # because Earth's curvature increases the slant distance to
+    # the shadow cone tip, making the cone cross-section smaller
+    # on the surface. This method applies a simple linear taper:
+    # at 3000 km from greatest eclipse the width is reduced by
+    # up to 60%, with a floor at 50% of the original width.
+
     def effective_half_width(self, dist_from_ge_km: float) -> float:
         """
         Path half-width adjusted for distance from greatest eclipse.
@@ -173,6 +299,20 @@ class Eclipse:
             return 0.0
         factor = max(0.5, 1.0 - dist_from_ge_km / 3000.0 * 0.6)
         return self.path_half_width * factor
+
+    # --- Cross-track (perpendicular) distance ---
+    # To decide if an observer is inside the totality corridor,
+    # we need their perpendicular distance from the centerline.
+    # The centerline direction is estimated from the path bearing.
+    # Then the spherical cross-track formula gives the shortest
+    # distance from the observer to that great-circle line:
+    #
+    #   cross_track = R · arcsin(sin(d13) · sin(bearing_diff))
+    #
+    # where d13 is the angular distance from the greatest-eclipse
+    # point to the observer. A gamma-based latitude gate quickly
+    # rejects observers too far north or south to possibly be in
+    # the path, saving computation.
 
     def perpendicular_distance_km(self, obs_lat: float, obs_lon: float) -> float:
         """
@@ -221,6 +361,24 @@ class Eclipse:
                     if at <= 7500:
                         min_xt = xt
         return min_xt
+
+    # --- Parallax-calibrated offset ---
+    # This is the central astronomy function. It estimates how
+    # far the Moon appears to be displaced from the Sun's center
+    # for a specific observer, expressed in Sun-radii.
+    #
+    # Physical basis: the Moon is only ~384 400 km away, so
+    # moving a few hundred km sideways on Earth shifts the
+    # Moon's apparent position against the distant Sun. The
+    # catalog's path width tells us exactly how far sideways
+    # you can be before totality ends. We use that as a
+    # calibration anchor:
+    #
+    #   At the path edge: offset = (magnitude − 1) × sun_radius
+    #
+    # Inside the path the offset is smaller (totality), outside
+    # it grows (partial eclipse), and far enough away the Moon
+    # misses the Sun entirely (no eclipse).
 
     def parallax_offset(self, obs_lat: float, obs_lon: float) -> float:
         """
@@ -271,7 +429,13 @@ class Eclipse:
             return min(base + dist_km / 3500.0 * 0.6, max_off + 0.3)
 
 
-# Backward-compatible wrapper used by draw_eclipse_sky
+# =================================================================
+# Convenience wrappers
+# =================================================================
+# These thin wrappers let the Streamlit app call Eclipse methods
+# without constructing the object manually every time.
+# =================================================================
+
 def viewer_offset(obs_lat: float, obs_lon: float, eclipse: Dict[str, Any]) -> float:
     """Wrapper: create Eclipse object and call parallax_offset."""
     return Eclipse(eclipse).parallax_offset(obs_lat, obs_lon)

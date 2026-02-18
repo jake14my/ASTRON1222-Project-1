@@ -25,6 +25,7 @@ from eclipse_utils import (
     Eclipse,
     viewer_offset as eclipse_viewer_offset,
 )
+from eclipse_catalog import EclipseCatalog
 
 # ============================================================
 # PAGE CONFIG
@@ -58,6 +59,8 @@ if not eclipse_list:
     st.error("Error: No eclipse data found in eclipse_data.json")
     st.stop()
 
+catalog = EclipseCatalog(eclipse_list)
+
 # ============================================================
 # GEOMETRY HELPERS (using shared utilities from eclipse_utils)
 # Additional functions specific to Streamlit app below
@@ -70,22 +73,8 @@ def viewer_offset(obs_lat, obs_lon, eclipse):
     return eclipse_viewer_offset(obs_lat, obs_lon, eclipse)
 
 
-def eclipse_visibility_km(eclipse):
-    raw = eclipse.get("_raw", {})
-    pw = raw.get("path_width_km", "-")
-    try:
-        path_w = float(pw)
-    except (ValueError, TypeError):
-        path_w = 0
-    return (path_w / 2 + 3500) if path_w > 0 else 2500
-
-
-def is_visible_from(eclipse, lat, lon):
-    raw = eclipse.get("_raw", {})
-    ecl_lat = parse_coord(raw.get("latitude", "0N"))
-    ecl_lon = parse_coord(raw.get("longitude", "0E"))
-    dist = haversine_km(lat, lon, ecl_lat, ecl_lon)
-    return dist <= eclipse_visibility_km(eclipse)
+# Visibility, local-view, and search methods are now on the
+# EclipseCatalog instance (`catalog`) imported from eclipse_utils.
 
 
 # ============================================================
@@ -141,7 +130,7 @@ def draw_eclipse_sky(eclipse, obs_lat, obs_lon, time_frac):
         f"Eclipse View:  {eclipse['date_raw']}  —  {ecl_type}\n"
         f"Observer: {obs_lat:.1f}°N, {obs_lon:.1f}°E   |   "
         f"{dist_km:,.0f} km from center   |   "
-        f"Obscuration: {obs_frac:.1%}",
+        f"Estimated obscuration: {obs_frac:.1%}",
         color="white", fontsize=11, fontweight="bold", pad=14,
     )
     info = f"Magnitude: {mag}   |   Saros: {eclipse.get('saros', '?')}"
@@ -158,76 +147,9 @@ def draw_eclipse_sky(eclipse, obs_lat, obs_lon, time_frac):
 # CHATBOT SEARCH HELPERS
 # ============================================================
 
-MONTH_MAP = {
-    "Jan": 1, "Feb": 2, "Mar": 3, "Apr": 4,
-    "May": 5, "Jun": 6, "Jul": 7, "Aug": 8,
-    "Sep": 9, "Oct": 10, "Nov": 11, "Dec": 12,
-}
-
-
-def parse_eclipse_date(date_str):
-    try:
-        parts = date_str.strip().split()
-        return datetime(int(parts[0]), MONTH_MAP.get(parts[1], 1), int(parts[2]))
-    except Exception:
-        return None
-
-
-def find_next_eclipses(lat, lon, n=3, after_date=None):
-    if after_date is None:
-        after_date = datetime.now()
-    results = []
-    for ecl in eclipse_list:
-        dt = parse_eclipse_date(ecl["date_raw"])
-        if dt is None or dt < after_date:
-            continue
-        if is_visible_from(ecl, lat, lon):
-            raw = ecl.get("_raw", {})
-            ecl_lat = parse_coord(raw.get("latitude", "0N"))
-            ecl_lon = parse_coord(raw.get("longitude", "0E"))
-            dist = haversine_km(lat, lon, ecl_lat, ecl_lon)
-            results.append((ecl, dt, dist))
-        if len(results) >= n:
-            break
-    return results
-
-
-def find_eclipse_by_date(target_date_str):
-    target = target_date_str.strip().lower()
-    matches = []
-    for ecl in eclipse_list:
-        raw_date = ecl["date_raw"].lower()
-        if target in raw_date or raw_date in target:
-            matches.append(ecl)
-    if not matches:
-        for ecl in eclipse_list:
-            raw_date = ecl["date_raw"].lower()
-            tokens = target.replace(",", " ").split()
-            if all(t in raw_date for t in tokens):
-                matches.append(ecl)
-    return matches
-
-
-def eclipse_summary(ecl, obs_lat=None, obs_lon=None):
-    raw = ecl.get("_raw", {})
-    ecl_lat = parse_coord(raw.get("latitude", "0N"))
-    ecl_lon = parse_coord(raw.get("longitude", "0E"))
-    lines = [
-        f"Date: {ecl['date_raw']}",
-        f"Type: {ecl['type']} (code: {ecl.get('type_code', '?')})",
-        f"Magnitude: {ecl.get('magnitude', '?')}",
-        f"Saros: {ecl.get('saros', '?')}",
-        f"Duration: {ecl.get('duration', 'N/A')}",
-        f"Greatest Eclipse at: {ecl_lat:.1f}°N, {ecl_lon:.1f}°E",
-        f"Path Width: {raw.get('path_width_km', 'N/A')} km",
-        f"Gamma: {raw.get('gamma', '?')}",
-    ]
-    if obs_lat is not None and obs_lon is not None:
-        dist = haversine_km(obs_lat, obs_lon, ecl_lat, ecl_lon)
-        visible = is_visible_from(ecl, obs_lat, obs_lon)
-        lines.append(f"Observer distance: {dist:,.0f} km from center")
-        lines.append(f"Visible from observer: {'Yes' if visible else 'No / unlikely'}")
-    return "\n".join(lines)
+# Search, summary, and date-parsing methods are now on catalog.
+# e.g. catalog.find_by_date(), catalog.find_next_visible(),
+#      catalog.summary(), catalog.parse_date()
 
 
 # ============================================================
@@ -238,7 +160,8 @@ SYSTEM_PROMPT = """You are an expert solar eclipse advisor. You help people find
 and plan for solar eclipses based on a NASA catalog of 224 eclipses from 2001-2100.
 
 When the user asks about eclipses, you will receive ECLIPSE DATA pulled from the
-database as context. Use that data to give accurate, specific answers.
+database as context. This app uses an approximate geometric model, so present
+location-specific claims as estimates unless confidence is high.
 
 Your capabilities:
 - Tell users the next visible eclipse(s) from their location
@@ -256,7 +179,9 @@ For example:
   VIEWER_SET: lat=30.3, lon=-97.7, eclipse=2024 Apr 08
 
 Keep answers concise but informative. Use the eclipse data provided - do not invent
-eclipse dates or magnitudes."""
+eclipse dates or magnitudes.
+When referring to local outcomes, prefer wording like "likely totality", "likely
+partial", or "near path edge (lower confidence)" instead of absolute certainty."""
 
 CITY_COORDS = {
     "new york": (40.7, -74.0), "los angeles": (34.1, -118.2),
@@ -275,6 +200,9 @@ CITY_COORDS = {
     "nashville": (36.2, -86.8), "portland": (45.5, -122.7),
     "indianapolis": (39.8, -86.2), "cleveland": (41.5, -81.7),
     "columbus": (39.96, -83.0), "cincinnati": (39.1, -84.5),
+    # Frequently requested eclipse location (2017 path of totality)
+    "madras": (44.63, -121.13), "madras oregon": (44.63, -121.13),
+    "madras, oregon": (44.63, -121.13), "madras or": (44.63, -121.13),
 }
 
 
@@ -309,11 +237,11 @@ def build_eclipse_context(user_message):
 
     if any(kw in msg for kw in ["next", "upcoming", "when", "soonest", "future"]):
         if obs_lat is not None:
-            results = find_next_eclipses(obs_lat, obs_lon, n=3)
+            results = catalog.find_next_visible(obs_lat, obs_lon, n=3)
             if results:
                 context_parts.append(f"NEXT ECLIPSES VISIBLE FROM ({obs_lat} N, {obs_lon} E):")
                 for ecl, dt, dist in results:
-                    context_parts.append(eclipse_summary(ecl, obs_lat, obs_lon))
+                    context_parts.append(catalog.summary(ecl, obs_lat, obs_lon))
                     context_parts.append("---")
             else:
                 context_parts.append(f"No upcoming eclipses found visible from ({obs_lat}, {obs_lon}).")
@@ -327,31 +255,31 @@ def build_eclipse_context(user_message):
         m = re.search(pat, user_message)
         if m:
             date_str = m.group(1)
-            matches = find_eclipse_by_date(date_str)
+            matches = catalog.find_by_date(date_str)
             if matches:
                 context_parts.append(f"ECLIPSES MATCHING '{date_str}':")
                 for ecl in matches[:5]:
-                    context_parts.append(eclipse_summary(ecl, obs_lat, obs_lon))
+                    context_parts.append(catalog.summary(ecl, obs_lat, obs_lon))
                     context_parts.append("---")
             break
 
     for etype in ["total", "annular", "hybrid", "partial"]:
         if etype in msg:
-            type_eclipses = [e for e in eclipse_list if e["type"].lower() == etype]
+            type_eclipses = [e for e in catalog.eclipses if e["type"].lower() == etype]
             context_parts.append(f"DATABASE: {len(type_eclipses)} {etype} eclipses in catalog.")
             now = datetime.now()
-            upcoming = [(e, parse_eclipse_date(e["date_raw"]))
+            upcoming = [(e, catalog.parse_date(e["date_raw"]))
                         for e in type_eclipses
-                        if parse_eclipse_date(e["date_raw"]) and
-                           parse_eclipse_date(e["date_raw"]) > now][:3]
+                        if catalog.parse_date(e["date_raw"]) and
+                           catalog.parse_date(e["date_raw"]) > now][:3]
             for e, dt in upcoming:
-                context_parts.append(eclipse_summary(e, obs_lat, obs_lon))
+                context_parts.append(catalog.summary(e, obs_lat, obs_lon))
                 context_parts.append("---")
             break
 
     if not context_parts:
         context_parts.append(
-            f"DATABASE: {len(eclipse_list)} solar eclipses from 2001-2100. "
+            f"DATABASE: {len(catalog)} solar eclipses from 2001-2100. "
             f"Types: Total, Annular, Hybrid, Partial. "
             f"Ask about a specific date, location, or eclipse type for detailed info."
         )
@@ -365,27 +293,16 @@ def parse_viewer_set(reply):
     Returns (lat, lon, eclipse_date_str) or (None, None, None).
     """
     m = re.search(
-        r'VIEWER_SET:\s*lat\s*=\s*(\-?\d+\.?\d*)\s*,\s*lon\s*=\s*(\-?\d+\.?\d*)\s*,\s*eclipse\s*=\s*(.+)',
-        reply
+        r'VIEWER_SET:\s*lat\s*=\s*(\-?\d+\.?\d*)\s*[,;\s]\s*lon\s*=\s*(\-?\d+\.?\d*)\s*[,;\s]\s*eclipse\s*=\s*([^\n\r]+)',
+        reply,
+        flags=re.IGNORECASE,
     )
     if m:
         return float(m.group(1)), float(m.group(2)), m.group(3).strip()
     return None, None, None
 
 
-def find_eclipse_index_by_date(date_str):
-    """Find the index of an eclipse matching a date string."""
-    date_str_lower = date_str.strip().lower()
-    for i, ecl in enumerate(eclipse_list):
-        if date_str_lower in ecl["date_raw"].lower() or ecl["date_raw"].lower() in date_str_lower:
-            return i
-    # Partial match
-    tokens = date_str_lower.replace(",", " ").split()
-    for i, ecl in enumerate(eclipse_list):
-        raw_lower = ecl["date_raw"].lower()
-        if all(t in raw_lower for t in tokens):
-            return i
-    return None
+# find_eclipse_index_by_date is now catalog.find_index_by_date()
 
 
 def chat_with_llm(user_message, chat_history):
@@ -433,7 +350,8 @@ if "viewer_time" not in st.session_state:
 # UI LAYOUT
 # ============================================================
 st.title("🌒 Eclipse Explorer")
-st.caption("Chat with the Eclipse Bot to find eclipses, then see what they look like from any location.")
+st.caption("Chat with the Eclipse Bot and explore estimated eclipse views from any location.")
+st.info("Location-specific eclipse classifications are geometric estimates. Near path edges, uncertainty is higher.")
 
 # Custom CSS: fixed-height scrollable chat container
 st.markdown("""
@@ -486,8 +404,8 @@ with col_chat:
             if -90 <= v_lat <= 90 and -180 <= v_lon <= 180:
                 st.session_state.viewer_lat = v_lat
                 st.session_state.viewer_lon = v_lon
-                idx = find_eclipse_index_by_date(v_eclipse)
-                if idx is not None and 0 <= idx < len(eclipse_list):
+                idx = catalog.find_index_by_date(v_eclipse)
+                if idx is not None and 0 <= idx < len(catalog):
                     st.session_state.viewer_eclipse_idx = idx
                     st.session_state.viewer_time = 0.0
                     st.toast(f"Viewer updated: {v_lat:.1f}°N, {v_lon:.1f}°E", icon="📍")
@@ -504,25 +422,22 @@ with col_viz:
     st.subheader("Eclipse Viewer")
 
     # Eclipse dropdown
-    eclipse_labels = [
-        f"{e['date_raw']}  —  {e['type']}  (Mag: {e['magnitude']})"
-        for e in eclipse_list
-    ]
+    eclipse_labels = catalog.labels
     # Ensure index is valid
-    valid_idx = max(0, min(st.session_state.viewer_eclipse_idx, len(eclipse_list) - 1))
+    valid_idx = max(0, min(st.session_state.viewer_eclipse_idx, len(catalog) - 1))
     if valid_idx != st.session_state.viewer_eclipse_idx:
         st.session_state.viewer_eclipse_idx = valid_idx
     
     selected_idx = st.selectbox(
         "Eclipse:",
-        range(len(eclipse_list)),
+        range(len(catalog)),
         index=st.session_state.viewer_eclipse_idx,
         format_func=lambda i: eclipse_labels[i],
         key="eclipse_select",
     )
     
     # Validate selected_idx is within bounds
-    if not (0 <= selected_idx < len(eclipse_list)):
+    if not (0 <= selected_idx < len(catalog)):
         selected_idx = 0
 
     # Sliders
@@ -546,12 +461,12 @@ with col_viz:
     )
 
     # Draw the eclipse
-    fig = draw_eclipse_sky(eclipse_list[selected_idx], lat, lon, time_frac)
+    fig = draw_eclipse_sky(catalog[selected_idx], lat, lon, time_frac)
     st.pyplot(fig)
     plt.close(fig)
 
     # Show eclipse info
-    ecl = eclipse_list[selected_idx]
+    ecl = catalog[selected_idx]
     raw = ecl.get("_raw", {})
     ecl_lat = parse_coord(raw.get("latitude", "0N"))
     ecl_lon = parse_coord(raw.get("longitude", "0E"))
@@ -563,3 +478,4 @@ with col_viz:
         f"**Saros:** {ecl.get('saros', '?')}  |  "
         f"**Duration:** {ecl.get('duration', 'N/A')}"
     )
+
