@@ -17,8 +17,8 @@ near path boundaries.
 """
 
 import re
-import numpy as np
-from typing import Optional, Tuple, Dict, Any
+import numpy as np 
+from typing import Tuple, Dict, Any
 
 # Month name to number mapping
 MONTH_NUM = {
